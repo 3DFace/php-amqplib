@@ -567,7 +567,7 @@ class AMQPChannel extends AbstractChannel
         }
 
         if ($func != null) {
-            call_user_func($func, $msg);
+            return call_user_func($func, $msg);
         }
     }
 
