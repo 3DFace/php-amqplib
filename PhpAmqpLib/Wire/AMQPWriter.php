@@ -2,6 +2,7 @@
 
 namespace PhpAmqpLib\Wire;
 
+use PhpAmqpLib\Exception\AMQPInvalidArgumentException;
 use PhpAmqpLib\Exception\AMQPOutOfBoundsException;
 
 class AMQPWriter
@@ -62,7 +63,8 @@ class AMQPWriter
      */
     public function getvalue()
     {
-        $this->flushbits();
+        /* temporarily needed for compatibility with write_bit unit tests */
+        if ($this->bitcount) $this->flushbits();
 
         return $this->out;
     }
@@ -72,7 +74,6 @@ class AMQPWriter
      */
     public function write($s)
     {
-        $this->flushbits();
         $this->out .= $s;
 
         return $this;
@@ -80,6 +81,7 @@ class AMQPWriter
 
     /**
      * Write a boolean value.
+     * (deprecated, use write_bits instead)
      */
     public function write_bit($b)
     {
@@ -106,15 +108,31 @@ class AMQPWriter
     }
 
     /**
+     * Write multiple bits as an octet.
+     */
+    public function write_bits($bits)
+    {
+        $value = 0;
+
+        foreach ($bits as $n => $bit) {
+            $bit = $bit ? 1 : 0;
+            $value |= ($bit << $n);
+        }
+
+        $this->out .= chr($value);
+
+        return $this;
+    }
+
+    /**
      * Write an integer as an unsigned 8-bit value.
      */
     public function write_octet($n)
     {
         if ($n < 0 || $n > 255) {
-            throw new \InvalidArgumentException('Octet out of range 0..255');
+            throw new AMQPInvalidArgumentException('Octet out of range 0..255');
         }
 
-        $this->flushbits();
         $this->out .= chr($n);
 
         return $this;
@@ -126,10 +144,9 @@ class AMQPWriter
     public function write_short($n)
     {
         if ($n < 0 ||  $n > 65535) {
-            throw new \InvalidArgumentException('Octet out of range 0..65535');
+            throw new AMQPInvalidArgumentException('Octet out of range 0..65535');
         }
 
-        $this->flushbits();
         $this->out .= pack('n', $n);
 
         return $this;
@@ -140,15 +157,13 @@ class AMQPWriter
      */
     public function write_long($n)
     {
-        $this->flushbits();
-        $this->out .= implode("", AMQPWriter::chrbytesplit($n,4));
+        $this->out .= pack('N', $n);
 
         return $this;
     }
 
     private function write_signed_long($n)
     {
-        $this->flushbits();
         // although format spec for 'N' mentions unsigned
         // it will deal with sinned integers as well. tested.
         $this->out .= pack('N', $n);
@@ -161,8 +176,16 @@ class AMQPWriter
      */
     public function write_longlong($n)
     {
-        $this->flushbits();
-        $this->out .= implode("", AMQPWriter::chrbytesplit($n,8));
+        // if PHP_INT_MAX is big enough for that
+        // (always on 64 bits, with smaller values in 32 bits)
+        if ($n <= PHP_INT_MAX) {
+            // trick explained in http://www.php.net/manual/fr/function.pack.php#109328
+            $n1 = ($n & 0xffffffff00000000) >> 32;
+            $n2 = ($n & 0x00000000ffffffff);
+            $this->out .= pack('NN', $n1, $n2);
+        } else {
+            $this->out .= implode("", AMQPWriter::chrbytesplit($n, 8));
+        }
 
         return $this;
     }
@@ -173,12 +196,12 @@ class AMQPWriter
      */
     public function write_shortstr($s)
     {
-        $this->flushbits();
-        if (strlen($s) > 255) {
-            throw new \InvalidArgumentException('String too long');
+        $len = strlen($s);
+        if ($len > 255) {
+            throw new AMQPInvalidArgumentException('String too long');
         }
 
-        $this->write_octet(strlen($s));
+        $this->write_octet($len);
         $this->out .= $s;
 
         return $this;
@@ -190,7 +213,6 @@ class AMQPWriter
      */
     public function write_longstr($s)
     {
-        $this->flushbits();
         $this->write_long(strlen($s));
         $this->out .= $s;
 
@@ -207,7 +229,6 @@ class AMQPWriter
      */
     public function write_array($a)
     {
-        $this->flushbits();
         $data = new AMQPWriter();
 
         foreach ($a as $v) {
@@ -224,6 +245,9 @@ class AMQPWriter
             } elseif (is_array($v)) {
                 $data->write('A');
                 $data->write_array($v);
+            } elseif (is_bool($v)) {
+                $data->write('t');
+                $data->write_octet($v ? 1 : 0);
             }
         }
 
@@ -250,7 +274,6 @@ class AMQPWriter
     */
     public function write_table($d)
     {
-        $this->flushbits();
         $table_data = new AMQPWriter();
         foreach ($d as $k=>$va) {
             list($ftype,$v) = $va;
@@ -275,8 +298,11 @@ class AMQPWriter
             } elseif ($ftype=='A') {
                 $table_data->write('A');
                 $table_data->write_array($v);
+            } elseif ($ftype=='t') {
+                $table_data->write('t');
+                $table_data->write_octet($v ? 1 : 0);
             } else {
-                throw new \InvalidArgumentException(sprintf("Invalid type '%s'", $ftype));
+                throw new AMQPInvalidArgumentException(sprintf("Invalid type '%s'", $ftype));
             }
         }
 

@@ -3,6 +3,7 @@
 namespace PhpAmqpLib\Wire;
 
 use PhpAmqpLib\Exception\AMQPTimeoutException;
+use PhpAmqpLib\Helper\MiscHelper;
 use PhpAmqpLib\Wire\AMQPDecimal;
 use PhpAmqpLib\Exception\AMQPRuntimeException;
 use PhpAmqpLib\Exception\AMQPOutOfBoundsException;
@@ -16,7 +17,18 @@ use PhpAmqpLib\Wire\IO\AbstractIO;
  */
 class AMQPReader
 {
+    const BIT = 1;
+    const OCTET = 1;
+    const SHORTSTR = 1;
+    const SHORT = 2;
+    const LONG  = 4;
+    const SIGNED_LONG = 4;
+    const READ_PHP_INT = 4; // use READ_ to avoid possible clashes with PHP
+    const LONGLONG = 8;
+    const TIMESTAMP = 8;
+
     protected $str;
+    protected $str_length;
     protected $offset;
     protected $bitcount;
     protected $is64bits;
@@ -25,23 +37,34 @@ class AMQPReader
     protected $io = null;
 
     /**
-     * @param string $str
-     * @param null   $sock
-     * @param int    $timeout
+     * @param string     $str
+     * @param AbstractIO $io
+     * @param int        $timeout
      */
     public function __construct($str, AbstractIO $io = null, $timeout = 0)
     {
-        if (!function_exists("bcmul")) {
-            throw new AMQPRuntimeException("'bc math' module required");
-        }
-
         $this->str = $str;
+        $this->str_length = strlen($this->str);
         $this->io = $io;
         $this->offset = 0;
         $this->bitcount = $this->bits = 0;
         $this->timeout = $timeout;
 
         $this->is64bits = ((int) 4294967296) != 0 ? true : false;
+    }
+    
+    /**
+     * Used to not need to create a new AMQPReader instance every time.
+     * when we can just pass a string and reset the object state.
+     * NOTE: since we are working with strings we don't need to pass an AbstractIO
+     *       or a timeout.
+     */
+    public function reuse($str)
+    {
+        $this->str = $str;
+        $this->str_length = strlen($this->str);
+        $this->offset = 0;
+        $this->bitcount = $this->bits = 0;
     }
 
     /**
@@ -80,7 +103,8 @@ class AMQPReader
         }
 
         // wait ..
-        $result = $this->io->select($this->timeout, 0);
+        list($sec, $usec) = MiscHelper::splitSecondsMicroseconds($this->timeout);
+        $result = $this->io->select($sec, $usec);
 
         if ($result === false) {
             throw new AMQPRuntimeException(sprintf("An error occurs", $this->timeout));
@@ -106,13 +130,14 @@ class AMQPReader
             $res = $this->io->read($n);
             $this->offset += $n;
         } else {
-            if (strlen($this->str) < $n) {
+            if ($this->str_length < $n) {
                 throw new AMQPRuntimeException("Error reading data. Requested $n bytes while string buffer has only " .
-                    strlen($this->str));
+                    $this->str_length);
             }
 
             $res = substr($this->str,0,$n);
             $this->str = substr($this->str,$n);
+            $this->str_length -= $n;
             $this->offset += $n;
         }
 
@@ -161,7 +186,7 @@ class AMQPReader
     /**
      * Reads 32 bit integer in big-endian byte order.
      *
-     * On 64 bit systems it will return always usngined int
+     * On 64 bit systems it will return always unsigned int
      * value in 0..2^32 range.
      *
      * On 32 bit systems it will return signed int value in
@@ -354,9 +379,12 @@ class AMQPReader
             case 'A': // Array
                 $val = $this->read_array();
                 break;
+            case 'b': // bit
+                $val = $this->read_bit();
+                break;
             default:
                 // UNKNOWN TYPE
-                throw new \RuntimeException("Usupported table field type {$fieldType}");
+                throw new AMQPRuntimeException("Usupported table field type {$fieldType}");
                 break;
         }
 

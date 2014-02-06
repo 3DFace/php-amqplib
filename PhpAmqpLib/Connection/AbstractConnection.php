@@ -8,24 +8,51 @@ use PhpAmqpLib\Exception\AMQPProtocolConnectionException;
 use PhpAmqpLib\Exception\AMQPRuntimeException;
 use PhpAmqpLib\Exception\AMQPTimeoutException;
 use PhpAmqpLib\Helper\MiscHelper;
-use PhpAmqpLib\Wire\AMQPWriter;
 use PhpAmqpLib\Wire\AMQPReader;
+use PhpAmqpLib\Wire\AMQPWriter;
 use PhpAmqpLib\Wire\IO\AbstractIO;
 
 class AbstractConnection extends AbstractChannel
 {
-    public static $LIBRARY_PROPERTIES = array(
-        "library" => array('S', "PHP AMQP Lib"),
-        "library_version" => array('S', "2.0")
-    );
+    /**
+     * Circular buffer to speed up prepare_content().
+     * Max size limited by $prepare_content_cache_max_size.
+     * @var array
+     * @see prepare_content()
+     */
+    private $prepare_content_cache;
 
     /**
-     * contructor parameters for clone
+     * Maximal size of $prepare_content_cache.
+     * @var int
+     */
+    private $prepare_content_cache_max_size;
+
+    public static $LIBRARY_PROPERTIES = array(
+        "library" => array('S', "PHP AMQP Lib"),
+        "library_version" => array('S', "2.0"),
+        "capabilities" => array(
+            'F',
+            array(
+                'publisher_confirms' => array('t', true),
+                'consumer_cancel_notify' => array('t', true),
+                'exchange_exchange_bindings' => array('t', true),
+                'basic.nack' => array('t', true)
+            )
+        )
+    );
+    
+    protected $channel_max = 65535;
+    
+    protected $frame_max = 131072;
+
+    /**
+     * constructor parameters for clone
      * @var array
      */
     protected $construct_params;
     /**
-     * close the connection in destructur
+     * close the connection in destructor
      * @var bool
      */
     protected $close_on_destruct = true ;
@@ -35,6 +62,8 @@ class AbstractConnection extends AbstractChannel
      */
     protected $io = null;
 
+    protected $wait_frame_reader;
+
     public function __construct($user, $password,
                                 $vhost="/",$insist=false,
                                 $login_method="AMQPLAIN",
@@ -42,8 +71,10 @@ class AbstractConnection extends AbstractChannel
                                 $locale="en_US",
                                 AbstractIO $io)
     {
-    	// save the params for the use of __clone
+        // save the params for the use of __clone
         $this->construct_params = func_get_args();
+
+        $this->wait_frame_reader = new AMQPReader(null);
 
         if ($user && $password) {
             $login_response = new AMQPWriter();
@@ -54,14 +85,14 @@ class AbstractConnection extends AbstractChannel
             $login_response = null;
         }
 
+        $this->prepare_content_cache = array();
+        $this->prepare_content_cache_max_size = 100;
+
         $d = self::$LIBRARY_PROPERTIES;
         while (true) {
             $this->channels = array();
             // The connection object itself is treated as channel 0
             parent::__construct($this, 0);
-
-            $this->channel_max = 65535;
-            $this->frame_max = 131072;
 
             $this->io = $io;
             $this->input = new AMQPReader(null, $this->io);
@@ -134,7 +165,7 @@ class AbstractConnection extends AbstractChannel
         $this->getIO()->close();
     }
 
-    protected function write($data)
+    public function write($data)
     {
         if ($this->debug) {
             MiscHelper::debug_msg("< [hex]:\n" . MiscHelper::hexdump($data, $htmloutput = false, $uppercase = true, $return = true));
@@ -165,27 +196,49 @@ class AbstractConnection extends AbstractChannel
     }
 
     public function send_content($channel, $class_id, $weight, $body_size,
-                        $packed_properties, $body)
+                        $packed_properties, $body, $pkt = null)
     {
-        $pkt = new AMQPWriter();
+        $this->prepare_content($channel, $class_id, $weight, $body_size,
+                        $packed_properties, $body, $pkt);
+        $this->write($pkt->getvalue());
+    }
 
-        $pkt->write_octet(2);
-        $pkt->write_short($channel);
-        $pkt->write_long(strlen($packed_properties)+12);
+    /**
+     * returns a new AMQPWriter or mutates the provided $pkt
+     */
+    public function prepare_content($channel, $class_id, $weight, $body_size,
+                        $packed_properties, $body, $pkt = null)
+    {
+        if (empty($pkt)) {
+            $pkt = new AMQPWriter();
+        }
 
-        $pkt->write_short($class_id);
-        $pkt->write_short($weight);
+        // Content already prepared ?
+        $key_cache = "$channel|$packed_properties|$class_id|$weight";
+        if (! isset($this->prepare_content_cache[$key_cache])) {
+            $w = new AMQPWriter();
+            $w->write_octet(2);
+            $w->write_short($channel);
+            $w->write_long(strlen($packed_properties)+12);
+            $w->write_short($class_id);
+            $w->write_short($weight);
+            $this->prepare_content_cache[$key_cache] = $w->getvalue();
+            if (count($this->prepare_content_cache) > $this->prepare_content_cache_max_size) {
+                reset($this->prepare_content_cache);
+                $old_key = key($this->prepare_content_cache);
+                unset($this->prepare_content_cache[$old_key]);
+            }
+        }
+        $pkt->write($this->prepare_content_cache[$key_cache]);
+
         $pkt->write_longlong($body_size);
         $pkt->write($packed_properties);
 
         $pkt->write_octet(0xCE);
-        $pkt = $pkt->getvalue();
-        $this->write($pkt);
 
         while ($body) {
             $payload = substr($body,0, $this->frame_max-8);
             $body = substr($body,$this->frame_max-8);
-            $pkt = new AMQPWriter();
 
             $pkt->write_octet(3);
             $pkt->write_short($channel);
@@ -194,18 +247,37 @@ class AbstractConnection extends AbstractChannel
             $pkt->write($payload);
 
             $pkt->write_octet(0xCE);
-            $pkt = $pkt->getvalue();
-            $this->write($pkt);
         }
+
+        return $pkt;
     }
 
-    protected function send_channel_method_frame($channel, $method_sig, $args="")
+    protected function send_channel_method_frame($channel, $method_sig, $args="", $pkt=null)
+    {
+        $pkt = $this->prepare_channel_method_frame($channel, $method_sig, $args, $pkt);
+
+        $this->write($pkt->getvalue());
+
+        if ($this->debug) {
+            $PROTOCOL_CONSTANTS_CLASS = self::$PROTOCOL_CONSTANTS_CLASS;
+                MiscHelper::debug_msg("< " . MiscHelper::methodSig($method_sig) . ": " .
+                           $PROTOCOL_CONSTANTS_CLASS::$GLOBAL_METHOD_NAMES[MiscHelper::methodSig($method_sig)]);
+        }
+
+    }
+
+    /**
+     * returns a new AMQPWriter or mutates the provided $pkt
+     */
+    protected function prepare_channel_method_frame($channel, $method_sig, $args="", $pkt = null)
     {
         if ($args instanceof AMQPWriter) {
             $args = $args->getvalue();
         }
 
-        $pkt = new AMQPWriter();
+        if (empty($pkt)) {
+            $pkt = new AMQPWriter();
+        }
 
         $pkt->write_octet(1);
         $pkt->write_short($channel);
@@ -217,8 +289,6 @@ class AbstractConnection extends AbstractChannel
         $pkt->write($args);
 
         $pkt->write_octet(0xCE);
-        $pkt = $pkt->getvalue();
-        $this->write($pkt);
 
         if ($this->debug) {
             $PROTOCOL_CONSTANTS_CLASS = self::$PROTOCOL_CONSTANTS_CLASS;
@@ -226,6 +296,7 @@ class AbstractConnection extends AbstractChannel
                            $PROTOCOL_CONSTANTS_CLASS::$GLOBAL_METHOD_NAMES[MiscHelper::methodSig($method_sig)]);
         }
 
+        return $pkt;
     }
 
     /**
@@ -237,12 +308,18 @@ class AbstractConnection extends AbstractChannel
         $this->input->setTimeout($timeout);
 
         try {
-            $frame_type = $this->input->read_octet();
-            $channel = $this->input->read_short();
-            $size = $this->input->read_long();
-            $payload = $this->input->read($size);
+            // frame_type + channel_id + size
+            $this->wait_frame_reader->reuse($this->input->read(AMQPReader::OCTET + AMQPReader::SHORT + AMQPReader::LONG));
 
-            $ch = $this->input->read_octet();
+            $frame_type = $this->wait_frame_reader->read_octet();
+            $channel = $this->wait_frame_reader->read_short();
+            $size = $this->wait_frame_reader->read_long();
+
+            // payload + ch
+            $this->wait_frame_reader->reuse($this->input->read($size + AMQPReader::OCTET));
+
+            $payload = $this->wait_frame_reader->read($size);
+            $ch = $this->wait_frame_reader->read_octet();
         } catch(AMQPTimeoutException $e) {
             $this->input->setTimeout($currentTimeout);
 
@@ -378,7 +455,7 @@ class AbstractConnection extends AbstractChannel
         $args = new AMQPWriter();
         $args->write_shortstr($virtual_host);
         $args->write_shortstr($capabilities);
-        $args->write_bit($insist);
+        $args->write_bits(array($insist));
         $this->send_method_frame(array(10, 40), $args);
 
         $wait = array(

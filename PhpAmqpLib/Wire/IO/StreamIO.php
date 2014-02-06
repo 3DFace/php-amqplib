@@ -4,6 +4,7 @@ namespace PhpAmqpLib\Wire\IO;
 
 use PhpAmqpLib\Exception\AMQPRuntimeException;
 use PhpAmqpLib\Exception\AMQPTimeoutException;
+use PhpAmqpLib\Helper\MiscHelper;
 
 class StreamIO extends AbstractIO
 {
@@ -27,8 +28,9 @@ class StreamIO extends AbstractIO
             throw new AMQPRuntimeException("Error Connecting to server($errno): $errstr ");
         }
 
-        if(!stream_set_timeout($this->sock, $read_write_timeout)) {
-            throw new \Exception ("Timeout could not be set");
+        list($sec, $usec) = MiscHelper::splitSecondsMicroseconds($read_write_timeout);
+        if(!stream_set_timeout($this->sock, $sec, $usec)) {
+            throw new AMQPIOException("Timeout could not be set");
         }
 
         stream_set_blocking($this->sock, 1);
@@ -41,6 +43,10 @@ class StreamIO extends AbstractIO
 
         while ($read < $n && !feof($this->sock) &&
             (false !== ($buf = fread($this->sock, $n - $read)))) {
+            
+            if ($buf === '') {
+                continue;
+            }
 
             $read += strlen($buf);
             $res .= $buf;
@@ -65,9 +71,7 @@ class StreamIO extends AbstractIO
                 throw new AMQPRuntimeException("Broken pipe or closed connection");
             }
 
-            // get status of socket to determine whether or not it has timed out
-            $info = stream_get_meta_data($this->sock);
-            if($info['timed_out']) {
+            if($this->timed_out()) {
                 throw new AMQPTimeoutException("Error sending data. Socket connection timed out");
             }
 
@@ -99,5 +103,12 @@ class StreamIO extends AbstractIO
         $write  = null;
         $except = null;
         return stream_select($read, $write, $except, $sec, $usec);
+    }
+
+    protected function timed_out()
+    {
+      // get status of socket to determine whether or not it has timed out
+      $info = stream_get_meta_data($this->sock);
+      return $info['timed_out'];
     }
 }
